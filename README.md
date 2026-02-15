@@ -27,7 +27,7 @@ A local-first, AI-powered music player that generates playlists based on your mo
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/AnkitBangadkar/Mood-Based-Music-Player.git
+   git clone https://github.com/Adj251006/Aaryanjadhav_MOOD_BASED_MUSIC_PLAYER.git
    cd Mood-Based-Music-Player
    ```
 
