@@ -47,7 +47,7 @@ A local-first, privacy-focused music player that generates intelligent playlists
 
 ```bash
 # Clone
-git clone https://github.com/AnkitBangadkar/Mood-Based-Music-Player.git
+git clone https://github.com/Adj251006/Aaryanjadhav_MOOD_BASED_MUSIC_PLAYER.git
 cd Mood-Based-Music-Player
 
 # Run
