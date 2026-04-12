@@ -1,10 +1,11 @@
 import sqlite3
 import threading
 from logger import get_logger
+import config
 
 log = get_logger("Database")
 
-DB_PATH = "library.db"
+DB_PATH = config.DB_PATH
 
 # Thread-local storage for connection pooling
 _local = threading.local()
@@ -48,9 +49,22 @@ def init_db():
             rich_description TEXT,
             lyrics_vec BLOB,
             audio_vec BLOB,
-            meta_vec BLOB
+            meta_vec BLOB,
+            embedding BLOB
         )
     """)
+
+    # Create scanned_folders table to track indexed directories
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS scanned_folders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            path TEXT UNIQUE NOT NULL,
+            last_scan_time REAL,
+            song_count INTEGER DEFAULT 0,
+            total_songs_in_db INTEGER DEFAULT 0
+        )
+    """)
+
     # Add new columns if they don't exist (migration for existing DBs)
     migrations = [
         "ALTER TABLE songs ADD COLUMN file_mtime REAL",
@@ -65,6 +79,16 @@ def init_db():
         "ALTER TABLE songs ADD COLUMN spectral_bandwidth REAL",
         "ALTER TABLE songs ADD COLUMN dynamic_range REAL",
         "ALTER TABLE songs ADD COLUMN mfccs TEXT",  # JSON string of 13 floats
+        # Embedding storage for incremental indexing
+        "ALTER TABLE songs ADD COLUMN embedding BLOB",
+        # CLAP audio embedding - shared audio/text space
+        "ALTER TABLE songs ADD COLUMN clap_embedding BLOB",
+        # Full lyrics text stored for retrieval
+        "ALTER TABLE songs ADD COLUMN lyrics_text TEXT",
+        # Track whether lyrics have been processed into mood_text/embedding
+        # 0 = lyrics updated but mood_text/embedding need regeneration
+        # 1 = fully processed (or no lyrics to process)
+        "ALTER TABLE songs ADD COLUMN lyrics_processed INTEGER DEFAULT 1",
     ]
     for migration in migrations:
         try:
@@ -100,6 +124,8 @@ def add_song(
     spectral_bandwidth=None,
     dynamic_range=None,
     mfccs=None,
+    clap_embedding=None,
+    lyrics_text=None,
 ):
     conn = get_connection()
     cursor = conn.cursor()
@@ -110,9 +136,10 @@ def add_song(
                 filepath, file_mtime, title, artist, album, genre, rich_description, 
                 bpm, energy, brightness, valence, arousal, mode, sentiment, has_lyrics,
                 lyrics_vec, audio_vec, meta_vec, lyrics_emotion, lyrics_emotion_score,
-                emotion_distribution, spectral_rolloff, spectral_bandwidth, dynamic_range, mfccs
+                emotion_distribution, spectral_rolloff, spectral_bandwidth, dynamic_range, mfccs,
+                clap_embedding, lyrics_text
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
             (
                 filepath,
@@ -140,6 +167,8 @@ def add_song(
                 spectral_bandwidth,
                 dynamic_range,
                 mfccs,
+                clap_embedding,
+                lyrics_text,
             ),
         )
         song_id = cursor.lastrowid
@@ -216,7 +245,34 @@ def clear_library():
     conn = get_connection()
     cursor = conn.cursor()
     cursor.execute("DELETE FROM songs")
+    cursor.execute("DELETE FROM scanned_folders")
     conn.commit()
+
+
+def clear_clap_embeddings():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE songs SET clap_embedding = NULL")
+    conn.commit()
+    log.info("Cleared all CLAP embeddings")
+
+
+def clear_embeddings():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("UPDATE songs SET embedding = NULL")
+    conn.commit()
+    log.info("Cleared all semantic embeddings")
+
+
+def delete_songs_by_filepath_prefix(prefix):
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM songs WHERE filepath LIKE ?", (prefix + "%",))
+    deleted = cursor.rowcount
+    conn.commit()
+    log.info(f"Deleted {deleted} songs with filepath prefix: {prefix}")
+    return deleted
 
 
 def get_song_count():
@@ -225,3 +281,242 @@ def get_song_count():
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) as count FROM songs")
     return cursor.fetchone()["count"]
+
+
+def update_song_embedding(song_id, embedding):
+    """Store the embedding vector for a song."""
+    if embedding is None:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Convert numpy array to bytes
+        embedding_bytes = (
+            embedding.tobytes() if hasattr(embedding, "tobytes") else embedding
+        )
+        cursor.execute(
+            "UPDATE songs SET embedding = ? WHERE id = ?", (embedding_bytes, song_id)
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error storing embedding for song {song_id}: {e}")
+
+
+def get_songs_with_embeddings():
+    """Get all songs that have embeddings stored."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, embedding FROM songs WHERE embedding IS NOT NULL")
+    return cursor.fetchall()
+
+
+def update_song_clap_embedding(song_id, clap_embedding):
+    """Store the CLAP embedding vector for a song."""
+    if clap_embedding is None:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        embedding_bytes = (
+            clap_embedding.tobytes()
+            if hasattr(clap_embedding, "tobytes")
+            else clap_embedding
+        )
+        cursor.execute(
+            "UPDATE songs SET clap_embedding = ? WHERE id = ?",
+            (embedding_bytes, song_id),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error storing CLAP embedding for song {song_id}: {e}")
+
+
+def get_songs_with_clap_embeddings():
+    """Get all songs that have CLAP embeddings stored."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, clap_embedding FROM songs WHERE clap_embedding IS NOT NULL"
+    )
+    return cursor.fetchall()
+
+
+def get_all_songs_with_embeddings():
+    """Get all songs with their embeddings loaded."""
+    import numpy as np
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM songs")
+    songs = cursor.fetchall()
+
+    result = []
+    for song in songs:
+        song_dict = dict(song)
+        if song_dict.get("embedding"):
+            # Convert bytes back to numpy array
+            try:
+                song_dict["embedding"] = np.frombuffer(
+                    song_dict["embedding"], dtype=np.float32
+                )
+            except Exception as e:
+                log.warning(f"Failed to load embedding for song {song_dict['id']}: {e}")
+                song_dict["embedding"] = None
+        result.append(song_dict)
+    return result
+
+
+# Scanned folders tracking
+def add_or_update_scanned_folder(path, song_count=0):
+    """Add or update a scanned folder entry."""
+    import time
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    total_songs = get_song_count()
+    try:
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO scanned_folders (path, last_scan_time, song_count, total_songs_in_db)
+            VALUES (?, ?, ?, ?)
+            """,
+            (path, time.time(), song_count, total_songs),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error updating scanned folder {path}: {e}")
+
+
+def get_scanned_folders():
+    """Get list of all scanned folders with metadata."""
+    import time
+
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT path, last_scan_time, song_count, total_songs_in_db FROM scanned_folders ORDER BY last_scan_time DESC"
+    )
+    folders = []
+    for row in cursor.fetchall():
+        folders.append(
+            {
+                "path": row["path"],
+                "last_scan_time": row["last_scan_time"],
+                "last_scan_formatted": time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(row["last_scan_time"])
+                )
+                if row["last_scan_time"]
+                else "Unknown",
+                "song_count": row["song_count"],
+                "total_songs_in_db": row["total_songs_in_db"],
+            }
+        )
+    return folders
+
+
+def remove_scanned_folder(path):
+    """Remove a folder from the scanned folders list."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("DELETE FROM scanned_folders WHERE path = ?", (path,))
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error removing scanned folder {path}: {e}")
+
+
+def get_song_lyrics(song_id):
+    """Get the lyrics text for a song by its ID. Returns None if not found or no lyrics."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT lyrics_text FROM songs WHERE id = ?", (song_id,))
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    return row["lyrics_text"] if row["lyrics_text"] else None
+
+
+def update_song_lyrics(
+    song_id,
+    lyrics_text,
+    lyrics_emotion=None,
+    lyrics_emotion_score=0.0,
+    emotion_distribution=None,
+    valence=None,
+    has_lyrics=True,
+):
+    """Update lyrics-related fields for a song and mark it as needing reprocessing."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute(
+            """UPDATE songs SET 
+                lyrics_text = ?, has_lyrics = ?, lyrics_emotion = ?, 
+                lyrics_emotion_score = ?, emotion_distribution = ?,
+                valence = ?, lyrics_processed = 0
+            WHERE id = ?""",
+            (
+                lyrics_text,
+                1 if has_lyrics else 0,
+                lyrics_emotion,
+                lyrics_emotion_score,
+                emotion_distribution,
+                valence,
+                song_id,
+            ),
+        )
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error updating lyrics for song {song_id}: {e}")
+
+
+def get_songs_without_lyrics():
+    """Get songs that have no lyrics and no lyrics_text stored (candidates for background fetch)."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT id, filepath, title, artist FROM songs WHERE has_lyrics = 0 AND (lyrics_text IS NULL OR lyrics_text = '')"
+    )
+    return cursor.fetchall()
+
+
+def get_songs_pending_reprocess():
+    """Get songs where lyrics were updated but mood_text/embedding haven't been regenerated."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM songs WHERE lyrics_processed = 0")
+    return cursor.fetchall()
+
+
+def mark_songs_reprocessed(song_ids):
+    """Mark songs as fully processed after their mood_text/embedding are regenerated."""
+    if not song_ids:
+        return
+    conn = get_connection()
+    cursor = conn.cursor()
+    placeholders = ",".join("?" * len(song_ids))
+    cursor.execute(
+        f"UPDATE songs SET lyrics_processed = 1 WHERE id IN ({placeholders})",
+        song_ids,
+    )
+    conn.commit()
+
+
+def update_song_rich_description(song_id, rich_description, valence=None):
+    """Update the rich_description (mood_text) for a song, optionally updating valence too."""
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        if valence is not None:
+            cursor.execute(
+                "UPDATE songs SET rich_description = ?, valence = ? WHERE id = ?",
+                (rich_description, valence, song_id),
+            )
+        else:
+            cursor.execute(
+                "UPDATE songs SET rich_description = ? WHERE id = ?",
+                (rich_description, song_id),
+            )
+        conn.commit()
+    except sqlite3.Error as e:
+        log.error(f"Error updating rich_description for song {song_id}: {e}")
